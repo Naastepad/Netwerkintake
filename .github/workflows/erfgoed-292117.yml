@@ -1,0 +1,160 @@
+name: Erfgoed Goes 292117 extract
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/erfgoed-292117.yml'
+      - 'erfgoed-292117-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python -m pip install --upgrade pip
+          python -m pip install pdfplumber beautifulsoup4 lxml
+      - name: Download and extract
+        run: |
+          mkdir -p output
+          curl -fL --retry 4 --retry-delay 3 'https://collecties.erfgoedvangoes.nl/detail.php?nav_id=3-1&positie=18&id=292117' -o output/detail_292117.html
+          python <<'PY'
+          import csv, hashlib, json, re, subprocess
+          from pathlib import Path
+          import pdfplumber
+          from bs4 import BeautifulSoup
+
+          out = Path('output')
+          detail_url = 'https://collecties.erfgoedvangoes.nl/detail.php?nav_id=3-1&positie=18&id=292117'
+          html = (out/'detail_292117.html').read_text(encoding='utf-8', errors='replace')
+          soup = BeautifulSoup(html, 'lxml')
+          page_title = soup.title.get_text(' ', strip=True) if soup.title else ''
+
+          candidates = []
+          for pattern in [
+              r'imgid[^0-9]{0,30}(\d{6,})',
+              r'icoon\.ico\?file=(\d+)',
+              r'HttpHandler[^"\']{0,120}?file=(\d+)',
+              r'\bfile\b[^0-9]{0,30}(\d{6,})',
+              r'\b(535\d{5})\b',
+          ]:
+              candidates.extend(re.findall(pattern, html, flags=re.I))
+          for tag in soup.find_all(True):
+              for value in tag.attrs.values():
+                  for item in (value if isinstance(value, list) else [value]):
+                      text = str(item)
+                      candidates.extend(re.findall(r'imgid[^0-9]{0,30}(\d{6,})', text, flags=re.I))
+                      candidates.extend(re.findall(r'icoon\.ico\?file=(\d+)', text, flags=re.I))
+                      candidates.extend(re.findall(r'\b(535\d{5})\b', text))
+          ordered = []
+          for candidate in candidates:
+              if candidate not in ordered:
+                  ordered.append(candidate)
+          (out/'candidate_ids.json').write_text(json.dumps(ordered, indent=2), encoding='utf-8')
+
+          found = None
+          tested = []
+          for candidate in ordered:
+              url = f'https://collecties.erfgoedvangoes.nl/HttpHandler/icoon.ico?file={candidate}&pdfviewer=1'
+              dest = out/f'candidate_{candidate}.bin'
+              proc = subprocess.run(['curl','-fL','--retry','2','--retry-delay','2',url,'-o',str(dest)], capture_output=True, text=True)
+              tested.append({'file': candidate, 'returncode': proc.returncode, 'bytes': dest.stat().st_size if dest.exists() else 0})
+              if proc.returncode == 0 and dest.exists() and dest.read_bytes()[:5] == b'%PDF-':
+                  found = candidate
+                  dest.rename(out/'source.pdf')
+                  break
+              if dest.exists():
+                  dest.unlink()
+          (out/'tested_files.json').write_text(json.dumps(tested, indent=2), encoding='utf-8')
+          if not found:
+              raise RuntimeError(f'No PDF found. candidates={ordered}, tested={tested}')
+
+          pdf_url = f'https://collecties.erfgoedvangoes.nl/HttpHandler/icoon.ico?file={found}&pdfviewer=1'
+          subprocess.run(['pdfinfo', str(out/'source.pdf')], check=True, stdout=(out/'pdfinfo.txt').open('w'))
+          subprocess.run(['pdftotext','-layout',str(out/'source.pdf'),str(out/'raw_text.txt')], check=True)
+
+          headers = ['pdf_pagina','folio','datum','verkoper','koper','eigendom','straat_ligging','belending_oost','belending_zuid','belending_west','belending_noord','opmerkingen']
+          def clean(v):
+              return '' if v is None else re.sub(r'\s+', ' ', str(v).replace('\r',' ').replace('\n',' ')).strip()
+
+          rows = []
+          counts = []
+          with pdfplumber.open(out/'source.pdf') as pdf:
+              page_count = len(pdf.pages)
+              pdf_metadata = pdf.metadata or {}
+              for pno, page in enumerate(pdf.pages, 1):
+                  tables = page.extract_tables() or []
+                  page_rows = 0
+                  for table in tables:
+                      for raw in table or []:
+                          if not raw:
+                              continue
+                          vals = [clean(v) for v in raw]
+                          if not any(vals):
+                              continue
+                          joined = ' '.join(vals).lower()
+                          if vals[0].lower() in {'folio','fol.','fol'} or ('datum' in joined and 'verkoper' in joined and ('folio' in joined or 'fol.' in joined)):
+                              continue
+                          if len(vals) < 10:
+                              vals += ['']*(10-len(vals))
+                          elif len(vals) > 10:
+                              vals = vals[:9] + [' '.join(vals[9:])]
+                          folio, datum = vals[0], vals[1]
+                          looks_new = bool(folio) and (bool(re.search(r'\d', folio)) or bool(datum))
+                          if not looks_new and rows and rows[-1][0] == pno:
+                              prev = rows[-1]
+                              for idx, value in enumerate(vals, start=1):
+                                  if value:
+                                      prev[idx] = (prev[idx] + ' ' + value).strip()
+                              continue
+                          rows.append([pno] + vals + [''])
+                          page_rows += 1
+                  counts.append([pno, len(tables), page_rows])
+
+          deduped, seen = [], set()
+          for row in rows:
+              key = tuple(row)
+              if key not in seen:
+                  seen.add(key)
+                  deduped.append(row)
+          rows = deduped
+          nisse_re = re.compile(r'(?<![A-Za-zÀ-ÿ])(Nissepadt|Nissepat|Nissepad|Nisse)(?![A-Za-zÀ-ÿ])', re.I)
+          nisse_rows = [r for r in rows if nisse_re.search(' | '.join(map(str,r)))]
+
+          for filename, data in [('all_rows.csv', rows), ('nissepat_matches.csv', nisse_rows)]:
+              with (out/filename).open('w', newline='', encoding='utf-8-sig') as f:
+                  w = csv.writer(f); w.writerow(headers); w.writerows(data)
+
+          meta = {}
+          for tag in soup.find_all('meta'):
+              k = tag.get('name') or tag.get('property'); v = tag.get('content')
+              if k and v: meta[k] = v
+          summary = {
+              'record_id':'292117','imgid':found,'detail_url':detail_url,'pdf_url':pdf_url,'page_title':page_title,
+              'meta':meta,'pdf_metadata':pdf_metadata,'page_count':page_count,'row_count':len(rows),'nisse_count':len(nisse_rows),
+              'first_row':rows[0] if rows else None,'last_row':rows[-1] if rows else None,'page_table_counts':counts,
+              'pdf_sha256':hashlib.sha256((out/'source.pdf').read_bytes()).hexdigest(),'pdf_bytes':(out/'source.pdf').stat().st_size,
+              'candidate_files':ordered,'tested_files':tested,
+          }
+          (out/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (out/'summary.txt').open('w', encoding='utf-8') as f:
+              f.write(f'HTML title: {page_title}\nPDF file: {found}\nPDF pages: {page_count}\nRows: {len(rows)}\nNisse matches: {len(nisse_rows)}\nFirst: {rows[0] if rows else None}\nLast: {rows[-1] if rows else None}\nPDF metadata: {pdf_metadata}\nPDF SHA256: {summary["pdf_sha256"]}\n\n')
+              for row in nisse_rows:
+                  f.write('NISSE: ' + ' | '.join(map(str,row)) + '\n')
+          print((out/'summary.txt').read_text(encoding='utf-8'))
+          PY
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: erfgoed-goes-292117
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
