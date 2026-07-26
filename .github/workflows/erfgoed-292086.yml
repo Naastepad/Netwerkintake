@@ -44,36 +44,46 @@ jobs:
 
           candidates = []
           patterns = [
-              r'imgid[=\\\"\'\s:]+(\\d+)',
-              r'file[=\\\"\'\s:]+(\\d+)',
-              r'icoon\\.ico\\?file=(\\d+)',
-              r'pdfviewer[^0-9]{0,80}(\\d{6,})',
+              r'imgid[^0-9]{0,30}(\d{6,})',
+              r'icoon\.ico\?file=(\d+)',
+              r'HttpHandler[^"\']{0,120}?file=(\d+)',
+              r'\bfile\b[^0-9]{0,30}(\d{6,})',
           ]
           for pattern in patterns:
               candidates.extend(re.findall(pattern, html, flags=re.I))
+          candidates.extend(re.findall(r'\b(535\d{5})\b', html))
 
-          # Also inspect all URLs and data attributes.
           for tag in soup.find_all(True):
-              for attr, value in tag.attrs.items():
+              for value in tag.attrs.values():
                   values = value if isinstance(value, list) else [value]
                   for item in values:
                       text = str(item)
-                      candidates.extend(re.findall(r'(?:imgid|file)=?(\\d{6,})', text, flags=re.I))
-                      candidates.extend(re.findall(r'icoon\\.ico\\?file=(\\d+)', text, flags=re.I))
+                      candidates.extend(re.findall(r'imgid[^0-9]{0,30}(\d{6,})', text, flags=re.I))
+                      candidates.extend(re.findall(r'icoon\.ico\?file=(\d+)', text, flags=re.I))
+                      candidates.extend(re.findall(r'\b(535\d{5})\b', text))
 
           ordered = []
-          for c in candidates:
-              if c not in ordered:
-                  ordered.append(c)
+          for candidate in candidates:
+              if candidate not in ordered:
+                  ordered.append(candidate)
 
-          # Test candidate files until a real PDF is found.
+          (out/'candidate_ids.json').write_text(json.dumps(ordered, indent=2), encoding='utf-8')
+
           found = None
           tested = []
           for candidate in ordered:
               url = f'https://collecties.erfgoedvangoes.nl/HttpHandler/icoon.ico?file={candidate}&pdfviewer=1'
               dest = out / f'candidate_{candidate}.bin'
-              result = subprocess.run(['curl','-fL','--retry','2','--retry-delay','2',url,'-o',str(dest)], capture_output=True, text=True)
-              tested.append({'file': candidate, 'returncode': result.returncode, 'bytes': dest.stat().st_size if dest.exists() else 0})
+              result = subprocess.run(
+                  ['curl','-fL','--retry','2','--retry-delay','2',url,'-o',str(dest)],
+                  capture_output=True, text=True
+              )
+              tested.append({
+                  'file': candidate,
+                  'returncode': result.returncode,
+                  'bytes': dest.stat().st_size if dest.exists() else 0,
+                  'stderr': result.stderr[-500:],
+              })
               if result.returncode == 0 and dest.exists() and dest.read_bytes()[:5] == b'%PDF-':
                   found = candidate
                   dest.rename(out/'source.pdf')
@@ -81,6 +91,7 @@ jobs:
               if dest.exists():
                   dest.unlink()
 
+          (out/'tested_files.json').write_text(json.dumps(tested, ensure_ascii=False, indent=2), encoding='utf-8')
           if not found:
               raise RuntimeError(f'No PDF candidate found. Candidates={ordered}; tested={tested}')
 
@@ -96,7 +107,7 @@ jobs:
           def clean(value):
               if value is None:
                   return ''
-              return re.sub(r'\\s+', ' ', str(value).replace('\\r',' ').replace('\\n',' ')).strip()
+              return re.sub(r'\s+', ' ', str(value).replace('\r',' ').replace('\n',' ')).strip()
 
           rows = []
           page_table_counts = []
@@ -122,7 +133,7 @@ jobs:
                               vals = vals[:9] + [' '.join(vals[9:])]
 
                           folio, datum = vals[0], vals[1]
-                          looks_new = bool(folio) and (bool(re.search(r'\\d', folio)) or bool(datum))
+                          looks_new = bool(folio) and (bool(re.search(r'\d', folio)) or bool(datum))
                           if not looks_new and rows and rows[-1][0] == pno:
                               previous = rows[-1]
                               for idx, value in enumerate(vals, start=1):
@@ -179,21 +190,22 @@ jobs:
           }
           (out/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
           with (out/'summary.txt').open('w', encoding='utf-8') as handle:
-              handle.write(f'HTML title: {page_title}\\n')
-              handle.write(f'PDF file: {found}\\n')
-              handle.write(f'PDF pages: {page_count}\\n')
-              handle.write(f'Rows: {len(rows)}\\n')
-              handle.write(f'Nisse matches: {len(nisse_rows)}\\n')
-              handle.write(f'First: {rows[0] if rows else None}\\n')
-              handle.write(f'Last: {rows[-1] if rows else None}\\n')
-              handle.write(f'PDF metadata: {pdf_metadata}\\n')
-              handle.write(f'PDF SHA256: {summary["pdf_sha256"]}\\n\\n')
+              handle.write(f'HTML title: {page_title}\n')
+              handle.write(f'PDF file: {found}\n')
+              handle.write(f'PDF pages: {page_count}\n')
+              handle.write(f'Rows: {len(rows)}\n')
+              handle.write(f'Nisse matches: {len(nisse_rows)}\n')
+              handle.write(f'First: {rows[0] if rows else None}\n')
+              handle.write(f'Last: {rows[-1] if rows else None}\n')
+              handle.write(f'PDF metadata: {pdf_metadata}\n')
+              handle.write(f'PDF SHA256: {summary["pdf_sha256"]}\n\n')
               for row in nisse_rows:
-                  handle.write('NISSE: ' + ' | '.join(map(str,row)) + '\\n')
+                  handle.write('NISSE: ' + ' | '.join(map(str,row)) + '\n')
           print((out/'summary.txt').read_text(encoding='utf-8'))
           PY
 
       - name: Upload output artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: erfgoed-goes-292086
