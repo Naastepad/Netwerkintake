@@ -1,0 +1,258 @@
+name: Erfgoed Goes 292035 extract
+
+on:
+  push:
+    branches:
+      - tmp-erfgoed-292035
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python -m pip install --upgrade pip
+          python -m pip install pdfplumber openpyxl beautifulsoup4 lxml
+
+      - name: Download source
+        run: |
+          mkdir -p output
+          curl -fL --retry 4 --retry-delay 3 \
+            'https://collecties.erfgoedvangoes.nl/detail.php?nav_id=2-1&index=12&imgid=53565660&id=292035' \
+            -o output/detail_292035.html
+          curl -fL --retry 4 --retry-delay 3 \
+            'https://collecties.erfgoedvangoes.nl/HttpHandler/icoon.ico?file=53565660&pdfviewer=1' \
+            -o output/source.pdf
+          file output/source.pdf
+          pdfinfo output/source.pdf | tee output/pdfinfo.txt
+          pdftotext -layout output/source.pdf output/raw_text.txt
+
+      - name: Extract tables and build workbook
+        run: |
+          python <<'PY'
+          import csv, hashlib, json, os, re
+          from pathlib import Path
+          import pdfplumber
+          from bs4 import BeautifulSoup
+          from openpyxl import Workbook, load_workbook
+          from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+          from openpyxl.utils import get_column_letter
+
+          out = Path('output')
+          detail_url = 'https://collecties.erfgoedvangoes.nl/detail.php?nav_id=2-1&index=12&imgid=53565660&id=292035'
+          pdf_url = 'https://collecties.erfgoedvangoes.nl/HttpHandler/icoon.ico?file=53565660&pdfviewer=1'
+
+          html = (out/'detail_292035.html').read_text(encoding='utf-8', errors='replace')
+          soup = BeautifulSoup(html, 'lxml')
+          page_title = soup.title.get_text(' ', strip=True) if soup.title else ''
+          meta = {}
+          for tag in soup.find_all('meta'):
+              key = tag.get('name') or tag.get('property')
+              val = tag.get('content')
+              if key and val:
+                  meta[key] = val
+
+          headers = [
+              'pdf_pagina','folio','datum','verkoper','koper','eigendom','straat_ligging',
+              'belending_oost','belending_zuid','belending_west','belending_noord','opmerkingen'
+          ]
+
+          def clean(v):
+              if v is None:
+                  return ''
+              return re.sub(r'\s+', ' ', str(v).replace('\r',' ').replace('\n',' ')).strip()
+
+          rows = []
+          page_table_counts = []
+          with pdfplumber.open(out/'source.pdf') as pdf:
+              page_count = len(pdf.pages)
+              for pno, page in enumerate(pdf.pages, 1):
+                  tables = page.extract_tables() or []
+                  page_rows = 0
+                  for table in tables:
+                      for r in table or []:
+                          if not r:
+                              continue
+                          vals = [clean(x) for x in r]
+                          if not any(vals):
+                              continue
+                          # skip obvious table headers
+                          joined = ' '.join(vals).lower()
+                          if vals[0].lower() == 'folio' or ('folio' in joined and 'datum' in joined and 'verkoper' in joined):
+                              continue
+                          # Expected source has 10 columns. Merge/pad defensively.
+                          if len(vals) < 10:
+                              vals += [''] * (10-len(vals))
+                          elif len(vals) > 10:
+                              vals = vals[:9] + [' '.join(vals[9:])]
+                          # A real deed row normally has a folio and/or date. Continuation-only lines are joined to prior row.
+                          folio = vals[0]
+                          datum = vals[1]
+                          looks_new = bool(folio) and (bool(re.search(r'\d', folio)) or bool(datum))
+                          if not looks_new and rows and rows[-1][0] == pno:
+                              prev = rows[-1]
+                              for idx, v in enumerate(vals, start=1):
+                                  if v:
+                                      prev[idx] = (prev[idx] + ' ' + v).strip()
+                              continue
+                          rows.append([pno] + vals + [''])
+                          page_rows += 1
+                  page_table_counts.append((pno, len(tables), page_rows))
+
+          # Remove exact duplicate rows while preserving order.
+          deduped = []
+          seen = set()
+          for r in rows:
+              key = tuple(r)
+              if key not in seen:
+                  seen.add(key)
+                  deduped.append(r)
+          rows = deduped
+
+          with (out/'all_rows.csv').open('w', newline='', encoding='utf-8-sig') as f:
+              w = csv.writer(f)
+              w.writerow(headers)
+              w.writerows(rows)
+
+          # Match family/location variants as complete lexical units; avoid Thonisse etc.
+          nisse_re = re.compile(r'(?<![A-Za-zÀ-ÿ])(Nissepadt|Nissepat|Nissepad|Nisse)(?![A-Za-zÀ-ÿ])', re.I)
+          nisse_rows = [r for r in rows if nisse_re.search(' | '.join(map(str, r)))]
+          with (out/'nissepat_matches.csv').open('w', newline='', encoding='utf-8-sig') as f:
+              w = csv.writer(f)
+              w.writerow(headers)
+              w.writerows(nisse_rows)
+
+          # Workbook
+          wb = Workbook()
+          dark = '1F4E78'
+          light = 'D9EAF7'
+          white = 'FFFFFF'
+          thin = Side(style='thin', color='C7D1D9')
+          border = Border(left=thin, right=thin, top=thin, bottom=thin)
+          header_font = Font(bold=True, color=white)
+          header_fill = PatternFill('solid', fgColor=dark)
+          header_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+          body_align = Alignment(vertical='top', wrap_text=True)
+          widths = [11,10,13,28,28,25,28,26,26,26,26,24]
+
+          def fill_sheet(ws, data):
+              ws.append(headers)
+              for c in ws[1]:
+                  c.font = header_font
+                  c.fill = header_fill
+                  c.alignment = header_align
+                  c.border = border
+              for row in data:
+                  ws.append(row)
+              for row in ws.iter_rows(min_row=2):
+                  for c in row:
+                      c.alignment = body_align
+                      c.border = border
+              for i,w in enumerate(widths, 1):
+                  ws.column_dimensions[get_column_letter(i)].width = w
+              ws.freeze_panes = 'A2'
+              ws.auto_filter.ref = ws.dimensions
+              ws.row_dimensions[1].height = 32
+
+          ws = wb.active
+          ws.title = 'Alle akten'
+          fill_sheet(ws, rows)
+          ws2 = wb.create_sheet('Nissepat')
+          fill_sheet(ws2, nisse_rows)
+
+          ws3 = wb.create_sheet('Bron en controle')
+          info = [
+              ('Record-ID', '292035'),
+              ('Detailpagina', detail_url),
+              ('Directe PDF', pdf_url),
+              ('imgid/file', '53565660'),
+              ('HTML-titel', page_title),
+              ('PDF-pagina’s', page_count),
+              ('Aantal akten', len(rows)),
+              ('Aantal Nissepat-treffers', len(nisse_rows)),
+              ('Eerste akte', ' | '.join(map(str, rows[0])) if rows else ''),
+              ('Laatste akte', ' | '.join(map(str, rows[-1])) if rows else ''),
+              ('Extractie', 'pdfplumber extract_tables per pagina; vervolgregels samengevoegd; exacte duplicaten verwijderd; bronspelling behouden.'),
+              ('og:title', meta.get('og:title','')),
+              ('og:description', meta.get('og:description','')),
+              ('og:image', meta.get('og:image','')),
+          ]
+          ws3.append(['Veld','Waarde'])
+          for c in ws3[1]:
+              c.font = header_font; c.fill = header_fill; c.alignment = header_align; c.border = border
+          for k,v in info:
+              ws3.append([k,v])
+          for row in ws3.iter_rows(min_row=2, max_col=2):
+              for c in row:
+                  c.alignment = body_align; c.border = border
+              row[0].font = Font(bold=True)
+          ws3.column_dimensions['A'].width = 28
+          ws3.column_dimensions['B'].width = 110
+
+          start = ws3.max_row + 2
+          ws3.cell(start,1,'Nissepat-vermeldingen').font = Font(bold=True, size=12)
+          start += 1
+          mini_headers = ['pdf_pagina','folio','datum','verkoper','koper','eigendom','straat_ligging','gevonden_in_volledige_rij']
+          for j,h in enumerate(mini_headers,1):
+              c=ws3.cell(start,j,h); c.font=header_font; c.fill=header_fill; c.alignment=header_align; c.border=border
+          for i,r in enumerate(nisse_rows,start+1):
+              vals = [r[0],r[1],r[2],r[3],r[4],r[5],r[6], ' | '.join(map(str,r))]
+              for j,v in enumerate(vals,1):
+                  c=ws3.cell(i,j,v); c.alignment=body_align; c.border=border
+          for j,w in enumerate([11,10,13,28,28,25,28,80],1):
+              ws3.column_dimensions[get_column_letter(j)].width=max(ws3.column_dimensions[get_column_letter(j)].width or 0,w)
+
+          # Determine a useful filename from visible metadata, but keep stable fallback.
+          filename = 'Erfgoed-Goes-292035-kadaster.xlsx'
+          xlsx = out/filename
+          wb.save(xlsx)
+
+          # Re-open verification
+          check = load_workbook(xlsx, read_only=True)
+          verification = {
+              'page_count': page_count,
+              'row_count': len(rows),
+              'nisse_count': len(nisse_rows),
+              'first_row': rows[0] if rows else None,
+              'last_row': rows[-1] if rows else None,
+              'sheetnames': check.sheetnames,
+              'all_akten_rows_including_header': check['Alle akten'].max_row,
+              'nisse_rows_including_header': check['Nissepat'].max_row,
+              'page_table_counts': page_table_counts,
+              'html_title': page_title,
+              'meta': meta,
+          }
+          check.close()
+          verification['sha256'] = hashlib.sha256(xlsx.read_bytes()).hexdigest()
+          verification['bytes'] = xlsx.stat().st_size
+          (out/'summary.json').write_text(json.dumps(verification, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          with (out/'summary.txt').open('w',encoding='utf-8') as f:
+              f.write(f'HTML title: {page_title}\n')
+              f.write(f'PDF pages: {page_count}\n')
+              f.write(f'Rows: {len(rows)}\n')
+              f.write(f'Nisse matches: {len(nisse_rows)}\n')
+              f.write(f'First: {rows[0] if rows else None}\n')
+              f.write(f'Last: {rows[-1] if rows else None}\n')
+              f.write(f'Workbook: {filename}\n')
+              f.write(f'SHA256: {verification["sha256"]}\n\n')
+              for r in nisse_rows:
+                  f.write('NISSE: ' + ' | '.join(map(str,r)) + '\n')
+          print((out/'summary.txt').read_text(encoding='utf-8'))
+          PY
+
+      - name: Upload output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: erfgoed-goes-292035
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
