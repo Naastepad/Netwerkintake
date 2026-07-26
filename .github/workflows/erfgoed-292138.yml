@@ -1,0 +1,45 @@
+name: Erfgoed Goes 292138 extract
+
+on:
+  pull_request:
+    branches: [tmp-erfgoed-292132]
+    paths:
+      - '.github/workflows/erfgoed-292138.yml'
+      - 'erfgoed-292138-trigger.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python -m pip install --upgrade pip
+          python -m pip install pdfplumber beautifulsoup4 lxml
+      - name: Prepare tested extractor
+        run: |
+          mkdir -p output
+          curl -fL --retry 4 --retry-delay 3 'https://collecties.erfgoedvangoes.nl/detail.php?nav_id=3-1&positie=20&id=292138' -o output/detail_292138.html
+          python <<'PY'
+          import re, textwrap
+          from pathlib import Path
+          template = Path('.github/workflows/erfgoed-292132.yml').read_text(encoding='utf-8')
+          body = template.split("python <<'PY'\n", 1)[1].rsplit('\n          PY', 1)[0]
+          body = textwrap.dedent(body)
+          body = body.replace('292132', '292138').replace('positie=19', 'positie=20')
+          Path('/tmp/extract_292138.py').write_text(body, encoding='utf-8')
+          PY
+          python /tmp/extract_292138.py
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: erfgoed-goes-292138
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
