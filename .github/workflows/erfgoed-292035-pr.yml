@@ -1,0 +1,42 @@
+name: Erfgoed Goes 292035 PR extract
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python -m pip install --upgrade pip
+          python -m pip install pdfplumber beautifulsoup4 lxml
+      - name: Download source
+        run: |
+          mkdir -p output
+          curl -fL --retry 4 --retry-delay 3 \
+            'https://collecties.erfgoedvangoes.nl/detail.php?nav_id=2-1&index=12&imgid=53565660&id=292035' \
+            -o output/detail_292035.html
+          curl -fL --retry 4 --retry-delay 3 \
+            'https://collecties.erfgoedvangoes.nl/HttpHandler/icoon.ico?file=53565660&pdfviewer=1' \
+            -o output/source.pdf
+          file output/source.pdf
+          pdfinfo output/source.pdf | tee output/pdfinfo.txt
+          pdftotext -layout output/source.pdf output/raw_text.txt
+      - name: Extract tables
+        run: python scripts/extract_292035.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: erfgoed-goes-292035
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
